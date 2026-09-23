@@ -1,0 +1,71 @@
+# Local development stack for the ConnectX backend.
+#
+# Brings up Postgres, PgBouncer (transaction pooling), and Redis so you can
+# exercise the full Phase 0/1 scaling setup locally:
+#
+#   docker compose up -d
+#
+# Then in backend/.env:
+#   # Point the app at PgBouncer (6432), NOT Postgres directly — this is what
+#   # lets many app instances share a small pool of real Postgres backends.
+#   DATABASE_URL=postgresql://postgres:postgres@localhost:6432/connectx
+#   REDIS_URL=redis://localhost:6379
+#
+# Apply the schema (either port works; 5432 bypasses the pooler):
+#   npm run db:migrate
+#
+# PgBouncer in transaction mode multiplexes up to MAX_CLIENT_CONN client
+# connections onto DEFAULT_POOL_SIZE real Postgres connections — the key to
+# scaling the stateless API tier horizontally without exhausting
+# Postgres max_connections.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: connectx
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d connectx"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: connectx
+      # Postgres 16 encrypts passwords with scram-sha-256 by default, so tell
+      # PgBouncer to authenticate the same way (its own default is md5).
+      AUTH_TYPE: scram-sha-256
+      # Transaction pooling: a connection is returned to the pool at the end of
+      # each transaction, giving the highest reuse. Requires the app to avoid
+      # session-level state (this codebase does — see README).
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "25"
+    ports:
+      # Host 6432 -> PgBouncer (which listens on 5432 inside the container).
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    # Dev-only: no persistence, purely a cache / rate-limit / buffer store.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+volumes:
+  pgdata:
